@@ -32,23 +32,19 @@ public class SMTPServer {
     }
 
     static class ClientHandler extends Thread {
-        private enum State {
-            INIT, HELO_RECEIVED, WAIT_MAIL, WAIT_RCPT, WAIT_DATA, WAIT_MESSAGE, END
-        }
+        private enum State { INIT, WAIT_MAIL, WAIT_RCPT, WAIT_DATA, WAIT_MESSAGE, END }
 
         private Socket socket;
         private BufferedReader in;
         private PrintWriter out;
         private String sender;
         private List<String> recipients;
-        private StringBuilder emailData;
         private State state;
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
             this.recipients = new ArrayList<>();
-            this.emailData = new StringBuilder();
-            this.state = State.INIT; 
+            this.state = State.INIT;
         }
 
         @Override
@@ -66,13 +62,9 @@ public class SMTPServer {
                     if (state == State.END) break;
                 }
             } catch (IOException e) {
-                System.err.println("Connexion interrompue !");
+                e.printStackTrace();
             } finally {
-                try {
-                    socket.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
+                try { socket.close(); } catch (IOException e) { e.printStackTrace(); }
             }
         }
 
@@ -80,47 +72,29 @@ public class SMTPServer {
             if (line.startsWith("HELO")) {
                 if (state == State.INIT) {
                     out.println("250 Hello " + line.substring(5));
-                    state = State.HELO_RECEIVED;
-                } else {
-                    out.println("503 Bad sequence of commands");
-                }
+                    state = State.WAIT_MAIL;
+                } else out.println("503 Bad sequence of commands");
             } else if (line.startsWith("MAIL FROM:")) {
-                if (state == State.HELO_RECEIVED) {
+                if (state == State.WAIT_MAIL) {
                     sender = line.substring(10).trim();
                     recipients.clear();
                     out.println("250 OK");
                     state = State.WAIT_RCPT;
-                } else {
-                    out.println("503 Bad sequence of commands");
-                }
+                } else out.println("503 Bad sequence of commands");
             } else if (line.startsWith("RCPT TO:")) {
                 if (state == State.WAIT_RCPT) {
                     String recipient = line.substring(8).trim();
                     if (checkRecipientExists(recipient)) {
                         recipients.add(recipient);
                         out.println("250 OK");
-                    } else {
-                        out.println("550 No such user");
-                    }
-                } else {
-                    out.println("503 Bad sequence of commands");
-                }
+                    } else out.println("501 No such user");
+                } else out.println("503 Bad sequence of commands");
             } else if (line.equals("DATA")) {
                 if (state == State.WAIT_RCPT && !recipients.isEmpty()) {
                     out.println("354 End data with <CR><LF>.<CR><LF>");
-                    emailData.setLength(0);
                     state = State.WAIT_MESSAGE;
-                } else {
-                    out.println("503 Bad sequence of commands");
-                }
-            } else if (state == State.WAIT_MESSAGE) {
-                if (line.equals(".")) {
-                    saveEmail();
-                    out.println("250 Message accepted for delivery");
-                    state = State.HELO_RECEIVED;
-                } else {
-                    emailData.append(line).append("\n");
-                }
+                    receiveEmail();
+                } else out.println("503 Bad sequence of commands");
             } else if (line.equals("QUIT")) {
                 out.println("221 Bye");
                 state = State.END;
@@ -134,20 +108,35 @@ public class SMTPServer {
             return userDir.exists() && userDir.isDirectory();
         }
 
-        private void saveEmail() {
-            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
-            for (String recipient : recipients) {
-                File userDir = new File(MAIL_DIR + recipient);
-                if (!userDir.exists()) {
-                    userDir.mkdirs();
+        private void receiveEmail() {
+            try {
+                String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+                Map<String, BufferedWriter> writers = new HashMap<>();
+
+                for (String recipient : recipients) {
+                    File userDir = new File(MAIL_DIR + recipient);
+                    if (!userDir.exists()) userDir.mkdirs();
+                    File emailFile = new File(userDir, timestamp + ".txt");
+                    writers.put(recipient, new BufferedWriter(new FileWriter(emailFile)));
                 }
-                File emailFile = new File(userDir, timestamp + ".txt");
-                try {
-                    Files.write(emailFile.toPath(), emailData.toString().getBytes());
-                    System.out.println("Email enregistré pour " + recipient + " : " + emailFile.getAbsolutePath());
-                } catch (IOException e) {
-                    e.printStackTrace();
+
+                String line;
+                while ((line = in.readLine()) != null) {
+                    if (line.equals(".")) break;
+                    for (BufferedWriter writer : writers.values()) {
+                        writer.write(line);
+                        writer.newLine();
+                    }
                 }
+
+                for (BufferedWriter writer : writers.values()) {
+                    writer.close();
+                }
+                out.println("250 Message accepted for delivery");
+                state = State.WAIT_MAIL;
+            } catch (IOException e) {
+                e.printStackTrace();
+                out.println("554 Error processing message");
             }
         }
     }
