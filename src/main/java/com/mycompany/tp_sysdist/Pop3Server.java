@@ -77,6 +77,9 @@ public class Pop3Server {
                         case "RSET":
                             handleRset();
                             break;
+                        case "NOOP":
+                            handleNoop();
+                            break;
                         case "QUIT":
                             handleQuit();
                             return;
@@ -114,7 +117,7 @@ public class Pop3Server {
 
             File[] emailFiles = userDir.listFiles();
             if (emailFiles != null) {
-                Arrays.sort(emailFiles, Comparator.comparing(File::getName)); // Keep order
+                Arrays.sort(emailFiles, Comparator.comparing(File::getName));
                 emails.addAll(Arrays.asList(emailFiles));
             }
             userMails.put(user, emails);
@@ -190,6 +193,11 @@ public class Pop3Server {
         private void handleRset() {
             deleteMarkers.get(currentUser).clear();
             out.println("+OK All deletion marks cleared");
+        }
+
+        /** ✅ NOOP Command - Does Nothing but Responds **/
+        private void handleNoop() {
+            out.println("+OK");
         }
 
         /** ✅ QUIT Command - Delete Marked Emails **/
