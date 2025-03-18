@@ -11,7 +11,7 @@ package com.mycompany.tp_sysdist;
 import java.io.*;
 import java.net.*;
 import java.text.SimpleDateFormat;
-import java.util.Date;
+import java.util.*;
 
 public class SMTPServer {
     private static final int PORT = 2525;
@@ -40,15 +40,14 @@ public class SMTPServer {
         private BufferedReader in;
         private PrintWriter out;
         private String sender;
-        private String recipient;
+        private List<String> recipients;
         private StringBuilder emailData;
         private boolean emailInProgress = false;
-        private boolean senderExists = false;
-        private boolean recipientExists = false;
         private boolean heloReceived = false;
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
+            this.recipients = new ArrayList<>();
             this.emailData = new StringBuilder();
         }
 
@@ -76,27 +75,26 @@ public class SMTPServer {
                         out.println("503 HELO first");
                     } else if (line.startsWith("MAIL FROM:")) {
                         sender = extractAddress(line);
-                        senderExists = checkUserExists(sender);
-                        if (senderExists) {
+                        if (checkUserExists(sender)) {
                             out.println("250 OK");
                         } else {
                             out.println("550 Sender not found");
                         }
                     } else if (line.startsWith("RCPT TO:")) {
-                        recipient = extractAddress(line);
-                        recipientExists = checkUserExists(recipient);
-                        if (recipientExists) {
+                        String recipient = extractAddress(line);
+                        if (checkUserExists(recipient)) {
+                            recipients.add(recipient);
                             out.println("250 OK");
                         } else {
                             out.println("550 Recipient not found");
                         }
                     } else if (line.equals("DATA")) {
-                        if (senderExists && recipientExists) {
+                        if (!recipients.isEmpty()) {
                             out.println("354 End data with <CRLF>.<CRLF>");
                             emailInProgress = true;
                             emailData.setLength(0);
                         } else {
-                            out.println("503 Need valid sender and recipient first");
+                            out.println("503 Need at least one valid recipient");
                         }
                     } else if (emailInProgress && line.equals(".")) {
                         saveEmail();
@@ -129,23 +127,25 @@ public class SMTPServer {
         }
 
         private void saveEmail() {
-            if (recipient == null || recipient.isEmpty()) {
-                return; // Pas de destinataire, pas d'enregistrement
+            if (recipients.isEmpty()) {
+                return;
             }
 
             String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
-            File userDir = new File(MAIL_DIR + recipient);
-            if (!userDir.exists()) {
-                userDir.mkdirs();
-            }
+            for (String recipient : recipients) {
+                File userDir = new File(MAIL_DIR + recipient);
+                if (!userDir.exists()) {
+                    userDir.mkdirs();
+                }
 
-            File emailFile = new File(userDir, timestamp + ".txt");
+                File emailFile = new File(userDir, timestamp + ".txt");
 
-            try (FileWriter writer = new FileWriter(emailFile)) {
-                writer.write(emailData.toString());
-                System.out.println("Email stocké: " + emailFile.getAbsolutePath());
-            } catch (IOException e) {
-                e.printStackTrace();
+                try (FileWriter writer = new FileWriter(emailFile)) {
+                    writer.write(emailData.toString());
+                    System.out.println("Email stocké pour " + recipient + " : " + emailFile.getAbsolutePath());
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
         }
     }
