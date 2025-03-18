@@ -10,6 +10,7 @@ package com.mycompany.tp_sysdist;
  */
 import java.io.*;
 import java.net.*;
+import java.nio.file.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
@@ -18,11 +19,6 @@ public class SMTPServer {
     private static final String MAIL_DIR = "mailserver/";
 
     public static void main(String[] args) {
-        File mailDir = new File(MAIL_DIR);
-        if (!mailDir.exists()) {
-            mailDir.mkdirs(); // Créer le dossier principal s'il n'existe pas
-        }
-
         try (ServerSocket serverSocket = new ServerSocket(PORT)) {
             System.out.println("Serveur SMTP démarré sur le port " + PORT);
 
@@ -36,19 +32,23 @@ public class SMTPServer {
     }
 
     static class ClientHandler extends Thread {
+        private enum State {
+            INIT, HELO_RECEIVED, WAIT_MAIL, WAIT_RCPT, WAIT_DATA, WAIT_MESSAGE, END
+        }
+
         private Socket socket;
         private BufferedReader in;
         private PrintWriter out;
         private String sender;
         private List<String> recipients;
         private StringBuilder emailData;
-        private boolean emailInProgress = false;
-        private boolean heloReceived = false;
+        private State state;
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
             this.recipients = new ArrayList<>();
             this.emailData = new StringBuilder();
+            this.state = State.INIT; 
         }
 
         @Override
@@ -57,92 +57,94 @@ public class SMTPServer {
                 in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 out = new PrintWriter(socket.getOutputStream(), true);
 
-                out.println("220 SMTP Server Ready");
+                out.println("220 Simple SMTP Server Ready");
 
                 String line;
                 while ((line = in.readLine()) != null) {
                     System.out.println("Client: " + line);
-
-                    if (line.startsWith("HELO ")) {
-                        String domain = line.substring(5).trim();
-                        if (!domain.isEmpty()) {
-                            heloReceived = true;
-                            out.println("250 Hello " + domain);
-                        } else {
-                            out.println("501 Syntax error in parameters");
-                        }
-                    } else if (!heloReceived) {
-                        out.println("503 HELO first");
-                    } else if (line.startsWith("MAIL FROM:")) {
-                        sender = extractAddress(line);
-                        if (checkUserExists(sender)) {
-                            out.println("250 OK");
-                        } else {
-                            out.println("550 Sender not found");
-                        }
-                    } else if (line.startsWith("RCPT TO:")) {
-                        String recipient = extractAddress(line);
-                        if (checkUserExists(recipient)) {
-                            recipients.add(recipient);
-                            out.println("250 OK");
-                        } else {
-                            out.println("550 Recipient not found");
-                        }
-                    } else if (line.equals("DATA")) {
-                        if (!recipients.isEmpty()) {
-                            out.println("354 End data with <CRLF>.<CRLF>");
-                            emailInProgress = true;
-                            emailData.setLength(0);
-                        } else {
-                            out.println("503 Need at least one valid recipient");
-                        }
-                    } else if (emailInProgress && line.equals(".")) {
-                        saveEmail();
-                        out.println("250 Message accepted for delivery");
-                        emailInProgress = false;
-                    } else if (line.equals("QUIT")) {
-                        out.println("221 Bye");
-                        break;
-                    } else {
-                        if (emailInProgress) {
-                            emailData.append(line).append("\n");
-                        } else {
-                            out.println("502 Command not implemented");
-                        }
-                    }
+                    processCommand(line.trim());
+                    if (state == State.END) break;
                 }
-                socket.close();
             } catch (IOException e) {
-                System.err.println("Erreur de connexion !");
+                System.err.println("Connexion interrompue !");
+            } finally {
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
         }
 
-        private String extractAddress(String line) {
-            return line.substring(line.indexOf(":") + 1).trim();
+        private void processCommand(String line) {
+            if (line.startsWith("HELO")) {
+                if (state == State.INIT) {
+                    out.println("250 Hello " + line.substring(5));
+                    state = State.HELO_RECEIVED;
+                } else {
+                    out.println("503 Bad sequence of commands");
+                }
+            } else if (line.startsWith("MAIL FROM:")) {
+                if (state == State.HELO_RECEIVED) {
+                    sender = line.substring(10).trim();
+                    recipients.clear();
+                    out.println("250 OK");
+                    state = State.WAIT_RCPT;
+                } else {
+                    out.println("503 Bad sequence of commands");
+                }
+            } else if (line.startsWith("RCPT TO:")) {
+                if (state == State.WAIT_RCPT) {
+                    String recipient = line.substring(8).trim();
+                    if (checkRecipientExists(recipient)) {
+                        recipients.add(recipient);
+                        out.println("250 OK");
+                    } else {
+                        out.println("550 No such user");
+                    }
+                } else {
+                    out.println("503 Bad sequence of commands");
+                }
+            } else if (line.equals("DATA")) {
+                if (state == State.WAIT_RCPT && !recipients.isEmpty()) {
+                    out.println("354 End data with <CR><LF>.<CR><LF>");
+                    emailData.setLength(0);
+                    state = State.WAIT_MESSAGE;
+                } else {
+                    out.println("503 Bad sequence of commands");
+                }
+            } else if (state == State.WAIT_MESSAGE) {
+                if (line.equals(".")) {
+                    saveEmail();
+                    out.println("250 Message accepted for delivery");
+                    state = State.HELO_RECEIVED;
+                } else {
+                    emailData.append(line).append("\n");
+                }
+            } else if (line.equals("QUIT")) {
+                out.println("221 Bye");
+                state = State.END;
+            } else {
+                out.println("502 Command not implemented");
+            }
         }
 
-        private boolean checkUserExists(String user) {
-            File userDir = new File(MAIL_DIR + user);
+        private boolean checkRecipientExists(String recipient) {
+            File userDir = new File(MAIL_DIR + recipient);
             return userDir.exists() && userDir.isDirectory();
         }
 
         private void saveEmail() {
-            if (recipients.isEmpty()) {
-                return;
-            }
-
             String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
             for (String recipient : recipients) {
                 File userDir = new File(MAIL_DIR + recipient);
                 if (!userDir.exists()) {
                     userDir.mkdirs();
                 }
-
                 File emailFile = new File(userDir, timestamp + ".txt");
-
-                try (FileWriter writer = new FileWriter(emailFile)) {
-                    writer.write(emailData.toString());
-                    System.out.println("Email stocké pour " + recipient + " : " + emailFile.getAbsolutePath());
+                try {
+                    Files.write(emailFile.toPath(), emailData.toString().getBytes());
+                    System.out.println("Email enregistré pour " + recipient + " : " + emailFile.getAbsolutePath());
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
