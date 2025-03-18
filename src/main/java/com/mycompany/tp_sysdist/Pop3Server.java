@@ -14,32 +14,32 @@ import java.net.*;
 import java.util.*;
 
 public class Pop3Server {
-    private static final int PORT = 1100;
-    private static final String MAIL_DIR = "mailserver/";
+    private static final int PORT = 110;
+    private static final String MAILDIR = "mailserver";
+    private static final Map<String, List<String>> userMails = new HashMap<>();
+    private static final Map<String, Boolean[]> deleteFlags = new HashMap<>();
+    
+    private enum State {AUTHORIZATION, TRANSACTION, UPDATE}
+    
+    public static void main(String[] args) throws IOException {
+        ServerSocket serverSocket = new ServerSocket(PORT);
+        System.out.println("POP3 Server is running on port " + PORT);
 
-    public static void main(String[] args) {
-        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-            System.out.println("Serveur POP3 démarré sur le port " + PORT);
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                new ClientHandler(clientSocket).start();
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
+        while (true) {
+            Socket clientSocket = serverSocket.accept();
+            new Thread(new ClientHandler(clientSocket)).start();
         }
     }
 
-    static class ClientHandler extends Thread {
-        private enum State { AUTHORIZATION, TRANSACTION, UPDATE, END }
-        private State state;
+    private static class ClientHandler implements Runnable {
         private Socket socket;
         private BufferedReader in;
         private PrintWriter out;
-        private String user;
+        private State state = State.AUTHORIZATION;
+        private String currentUser = null;
 
         public ClientHandler(Socket socket) {
             this.socket = socket;
-            this.state = State.AUTHORIZATION;
         }
 
         @Override
@@ -47,93 +47,147 @@ public class Pop3Server {
             try {
                 in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 out = new PrintWriter(socket.getOutputStream(), true);
-
                 out.println("+OK POP3 server ready");
 
                 String line;
                 while ((line = in.readLine()) != null) {
-                    System.out.println("Client: " + line);
-                    processCommand(line.trim());
-                    if (state == State.END) break;
+                    String[] parts = line.split(" ", 2);
+                    String command = parts[0].toUpperCase();
+                    String argument = (parts.length > 1) ? parts[1] : "";
+
+                    switch (command) {
+                        case "USER": handleUSER(argument); break;
+                        case "PASS": handlePASS(argument); break;
+                        case "STAT": handleSTAT(); break;
+                        case "LIST": handleLIST(); break;
+                        case "RETR": handleRETR(argument); break;
+                        case "DELE": handleDELE(argument); break;
+                        case "QUIT": handleQUIT(); return;
+                        default: out.println("-ERR Unknown command");
+                    }
                 }
             } catch (IOException e) {
                 e.printStackTrace();
             } finally {
-                try { socket.close(); } catch (IOException e) { e.printStackTrace(); }
+                try { socket.close(); } catch (IOException ignored) {}
             }
         }
 
-        private void processCommand(String line) {
-            if (line.startsWith("USER ")) {
-                if (state == State.AUTHORIZATION) {
-                    user = line.substring(5);
-                    if (new File(MAIL_DIR + user).exists()) {
-                        out.println("+OK user accepted");
-                    } else {
-                        out.println("-ERR user not found");
-                    }
-                } else {
-                    out.println("-ERR bad sequence of commands");
-                }
-            } else if (line.startsWith("PASS ")) {
-                if (state == State.AUTHORIZATION && user != null) {
-                    state = State.TRANSACTION;
-                    out.println("+OK password accepted");
-                } else {
-                    out.println("-ERR bad sequence of commands");
-                }
-            } else if (line.equals("STAT")) {
-                if (state == State.TRANSACTION) {
-                    File userDir = new File(MAIL_DIR + user);
-                    String[] emails = userDir.list((dir, name) -> name.endsWith(".txt"));
-                    out.println("+OK " + (emails != null ? emails.length : 0) + " messages");
-                } else {
-                    out.println("-ERR bad sequence of commands");
-                }
-            } else if (line.equals("LIST")) {
-                if (state == State.TRANSACTION) {
-                    File userDir = new File(MAIL_DIR + user);
-                    String[] emails = userDir.list((dir, name) -> name.endsWith(".txt"));
-                    if (emails != null && emails.length > 0) {
-                        out.println("+OK " + emails.length + " messages");
-                        for (int i = 0; i < emails.length; i++) {
-                            out.println((i + 1) + " " + new File(userDir, emails[i]).length());
-                        }
-                    } else {
-                        out.println("-ERR no messages");
-                    }
-                } else {
-                    out.println("-ERR bad sequence of commands");
-                }
-            } else if (line.startsWith("RETR ")) {
-                if (state == State.TRANSACTION) {
-                    int msgNum = Integer.parseInt(line.substring(5));
-                    File userDir = new File(MAIL_DIR + user);
-                    String[] emails = userDir.list((dir, name) -> name.endsWith(".txt"));
-                    if (emails != null && msgNum > 0 && msgNum <= emails.length) {
-                        File emailFile = new File(userDir, emails[msgNum - 1]);
-                        try (BufferedReader emailReader = new BufferedReader(new FileReader(emailFile))) {
-                            out.println("+OK message follows");
-                            String emailLine;
-                            while ((emailLine = emailReader.readLine()) != null) {
-                                out.println(emailLine);
-                            }
-                            out.println(".");
-                        } catch (IOException e) {
-                            out.println("-ERR error reading message");
-                        }
-                    } else {
-                        out.println("-ERR no such message");
-                    }
-                } else {
-                    out.println("-ERR bad sequence of commands");
-                }
-            } else if (line.equals("QUIT")) {
-                out.println("+OK POP3 server signing off");
-                state = State.END;
-            } else {
-                out.println("-ERR command not recognized");
+        private void handleUSER(String user) {
+            if (state != State.AUTHORIZATION) {
+                out.println("-ERR Invalid state");
+                return;
             }
+            if (new File(MAILDIR + "/" + user).exists()) {
+                currentUser = user;
+                out.println("+OK User accepted");
+            } else {
+                out.println("-ERR User not found");
+            }
+        }
+
+        private void handlePASS(String pass) {
+            if (state != State.AUTHORIZATION || currentUser == null) {
+                out.println("-ERR Invalid state");
+                return;
+            }
+            state = State.TRANSACTION;
+            loadMails(currentUser);
+            out.println("+OK Password accepted");
+        }
+
+        private void handleSTAT() {
+            if (state != State.TRANSACTION) {
+                out.println("-ERR Invalid state");
+                return;
+            }
+            int count = userMails.get(currentUser).size();
+            int size = userMails.get(currentUser).stream().mapToInt(String::length).sum();
+            out.println("+OK " + count + " " + size);
+        }
+
+        private void handleLIST() {
+            if (state != State.TRANSACTION) {
+                out.println("-ERR Invalid state");
+                return;
+            }
+            List<String> mails = userMails.get(currentUser);
+            Boolean[] flags = deleteFlags.get(currentUser);
+            for (int i = 0; i < mails.size(); i++) {
+                if (!flags[i]) {
+                    out.println("+OK " + (i + 1) + " " + mails.get(i).length());
+                }
+            }
+            out.println(".");
+        }
+
+        private void handleRETR(String arg) {
+            if (state != State.TRANSACTION) {
+                out.println("-ERR Invalid state");
+                return;
+            }
+            int index = Integer.parseInt(arg) - 1;
+            List<String> mails = userMails.get(currentUser);
+            if (index < 0 || index >= mails.size() || deleteFlags.get(currentUser)[index]) {
+                out.println("-ERR No such message");
+                return;
+            }
+            out.println("+OK " + mails.get(index).length() + " octets");
+            out.println(mails.get(index));
+            out.println(".");
+        }
+
+        private void handleDELE(String arg) {
+            if (state != State.TRANSACTION) {
+                out.println("-ERR Invalid state");
+                return;
+            }
+            int index = Integer.parseInt(arg) - 1;
+            if (index < 0 || index >= userMails.get(currentUser).size() || deleteFlags.get(currentUser)[index]) {
+                out.println("-ERR No such message");
+                return;
+            }
+            deleteFlags.get(currentUser)[index] = true;
+            out.println("+OK Message marked for deletion");
+        }
+
+        private void handleQUIT() {
+            if (state == State.TRANSACTION) {
+                state = State.UPDATE;
+                List<String> mails = userMails.get(currentUser);
+                Boolean[] flags = deleteFlags.get(currentUser);
+                for (int i = mails.size() - 1; i >= 0; i--) {
+                    if (flags[i]) {
+                        mails.remove(i);
+                    }
+                }
+                saveMails(currentUser);
+            }
+            out.println("+OK POP3 server signing off");
+        }
+
+        private void loadMails(String user) {
+            File folder = new File(MAILDIR + "/" + user);
+            List<String> mails = new ArrayList<>();
+            for (File file : Objects.requireNonNull(folder.listFiles())) {
+                try (BufferedReader br = new BufferedReader(new FileReader(file))) {
+                    StringBuilder content = new StringBuilder();
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        content.append(line).append("\n");
+                    }
+                    mails.add(content.toString());
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+            userMails.put(user, mails);
+            deleteFlags.put(user, new Boolean[mails.size()]);
+            Arrays.fill(deleteFlags.get(user), false);
+        }
+
+        private void saveMails(String user) {
+            // Implement file-based saving mechanism
         }
     }
 }
